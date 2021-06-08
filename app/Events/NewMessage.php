@@ -38,8 +38,8 @@ class NewMessage implements ShouldBroadcast
         //return new Channel('home');
 
         return [
-            new PrivateChannel('user.' . $this->message->sender_id),
-            new PrivateChannel('user.' . $this->message->receiver_id),
+            new channel('user.' . $this->message->sender_id),
+            new channel('user.' . $this->message->receiver_id),
         ];
     }
 }
