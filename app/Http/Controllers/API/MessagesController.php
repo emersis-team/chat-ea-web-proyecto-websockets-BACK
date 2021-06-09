@@ -7,6 +7,7 @@ use App\Models\Message;
 use App\Events\NewMessage;
 use App\Models\FileMessage;
 use App\Models\TextMessage;
+use App\Models\PositionMessage;
 use App\Models\Conversation;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -14,6 +15,7 @@ use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Validator;
 use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
 
@@ -179,69 +181,6 @@ class MessagesController extends Controller
         }
 
     }
-    public function createMessage_OLD(Request $request, Conversation $conversation)
-    {
-        $user = Auth::user();
-
-        //Chequea los campos de entrada
-        $campos = $request->validate([
-          'message' => 'required',
-        ]);
-
-        //var_dump($conversation->id);
-
-        if ($user->id !== $conversation->user_id_1 && $user->id !== $conversation->user_id_2) {
-          throw new AccessDeniedHttpException(__('No existe la conversación para el usuario.'));
-        }
-
-        if($conversation->user_1['id'] == $user->id){
-            $receiver = $conversation->user_2['id'];
-        }else{
-            $receiver = $conversation->user_1['id'];
-        }
-
-        try {
-
-          $message = Message::create([
-            'sender_id' => $user->id,
-            'receiver_id' => $receiver,
-            'conversation_id' => $conversation->id,
-            'message' => $campos['message'],
-          ]);
-
-          if (!$message) {
-            throw new \Error('No se pudo crear el mensaje.');
-          }
-
-          Conversation::where('id',$conversation->id)
-                        ->update(['updated_at' => now()]);
-
-          return response()->json([
-            'status' => 200,
-            'message' => 'Creación del mensaje realizada con éxito',
-            'conversation_id' => $conversation->id,
-            'message_id' => $message->id,
-            "sender_id" => $message->sender_id,
-            "receiver_id" => $message->receiver_id,
-            'message_created' => $message->message
-            ]);
-
-        }
-
-        catch (QueryException $e) {
-            throw new \Error('Error SQL');
-        }
-
-        catch (\Throwable $e) {
-            DB::rollBack();
-
-            $code = $e->getCode() ? $e->getCode() : 500;
-            return response()->json([
-                'status' => $e->getCode() ? $e->getCode() : 500,
-                'message' => $e->getMessage()
-            ], $code);
-        }
-    }
     public function createTextMessage(Request $request)
     {
         $user = Auth::user();
@@ -252,7 +191,7 @@ class MessagesController extends Controller
             //Chequea los campos de entrada
             $campos = $request->validate([
                 'message' => ['required','string', 'max:255'],
-                'receiver_id' => ['required','integer']
+                'receiver_id' => ['required','integer', 'exists:users,id'],
             ]);
 
             $user_dest = User::where('id',$campos['receiver_id'])
@@ -308,15 +247,7 @@ class MessagesController extends Controller
 
             DB::commit();
 
-            //Disparo evento de Nuevo Mensaje
-            // $mensaje = [
-            //     'conversation_id' => $message->conversation_id,
-            //     'message_id' => $message->id,
-            //     "sender_id" => $message->sender_id,
-            //     "receiver_id" => $message->receiver_id,
-            //     'message_created' => $message->message
-            // ];
-
+            //Se lanza evento de Nuevo Mensaje
             broadcast(new NewMessage($message));
 
             return response()->json([
@@ -465,6 +396,10 @@ class MessagesController extends Controller
                          ->update(['updated_at' => now()]);
 
             DB::commit();
+
+            //Se lanza evento de Nuevo Mensaje
+            broadcast(new NewMessage($message));
+
             return response()->json([
                 'status' => 200,
                 'message' => 'Creación del mensaje de FILE realizada con éxito',
@@ -509,6 +444,103 @@ class MessagesController extends Controller
             return response()->json(['errors' => $e->getMessage()], 400);
 
 
+        }
+    }
+    public function createPositionMessage(Request $request)
+    {
+        $user = Auth::user();
+
+        DB::beginTransaction();
+        try {
+
+            //Chequea los campos de entrada
+            $campos = $request->validate([
+                'lat' => ['required','numeric'],
+                'lon' => ['required','numeric'],
+                'alt' => ['required','numeric'],
+                'receiver_id' => ['required','integer','exists:users,id']
+            ]);
+
+            if ($user->id == $campos['receiver_id']) {
+                throw new AccessDeniedHttpException(__('No se puede enviar mensaje al usuario destino.'));
+            }
+            $conversation = Conversation::where(function($q) use ($user, $campos){
+                                            $q->where('user_id_1', $user->id);
+                                            $q->where('user_id_2', $campos['receiver_id']);
+                                        })
+                                        ->orWhere(function($q) use ($user, $campos){
+                                            $q->where('user_id_2', $user->id);
+                                            $q->where('user_id_1', $campos['receiver_id']);
+                                        })
+                                        ->first();
+
+            if (!$conversation){ //La conversacion NO existe, se crea antes del mensaje
+                $conversation = Conversation::create([
+                    'user_id_1' => $user->id,
+                    'user_id_2' => $campos['receiver_id'],
+                    ]);
+
+                if (!$conversation) {
+                   throw new \Error('No se pudo crear la conversación.');
+                }
+            }
+
+            //Crea el mje de posición
+            $position_message = PositionMessage::create([
+                'lat' => $campos['lat'],
+                'lon' => $campos['lon'],
+                'alt' => $campos['alt']
+              ]);
+
+              if (!$position_message) {
+                throw new \Error('No se pudo crear el mensaje de posición.');
+              }
+
+            // Crea el mensaje y lo asocia a la conversacion
+            $message = Message::create([
+                'sender_id' => $user->id,
+                'receiver_id' => (int) $campos['receiver_id'],
+                'conversation_id' => $conversation->id,
+                'message_type' => get_class($position_message),
+                'message_id' => $position_message->id,
+            ]);
+
+            if (!$message) {
+                throw new \Error('No se pudo crear el mensaje.');
+            }
+
+            Conversation::where('id',$conversation->id)
+                          ->update(['updated_at' => now()]);
+
+            DB::commit();
+
+            //Se lanza evento de Nuevo Mensaje
+            broadcast(new NewMessage($message));
+
+            return response()->json([
+                'status' => 200,
+                'message' => 'Creación del mensaje de POSICIÓN realizada con éxito',
+                'conversation_id' => $message->conversation_id,
+                'message_id' => $message->id,
+                "sender_id" => $message->sender_id,
+                "receiver_id" => $message->receiver_id,
+                'message_created' => $message->message
+            ]);
+
+        }
+
+        catch (QueryException $e) {
+            throw new \Error('Error SQL');
+        }
+
+        catch (\Throwable $e) {
+            DB::rollBack();
+
+            $code = $e->getCode() ? $e->getCode() : 500;
+            return response()->json([
+                'status' => $e->getCode() ? $e->getCode() : 500,
+                'message' => $e->getMessage()
+            ], $code);
         }
     }
 }
